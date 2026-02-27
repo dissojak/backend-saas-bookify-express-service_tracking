@@ -4,7 +4,7 @@ const userBehaviorProfileSchema = new mongoose.Schema(
   {
     userId: {
       type: String,
-      default: null,
+      // No default — field must be absent (not null) for sparse unique index to work
       unique: true,
       sparse: true,
       index: true,
@@ -12,7 +12,7 @@ const userBehaviorProfileSchema = new mongoose.Schema(
     },
     anonymousId: {
       type: String,
-      default: null,
+      // No default — field must be absent (not null) for sparse unique index to work
       unique: true,
       sparse: true,
       index: true,

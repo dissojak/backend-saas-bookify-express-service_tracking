@@ -122,22 +122,26 @@ exports.aggregateUserProfile = async (userId) => {
 
     const deviceTypes = new Map(deviceStats.map((d) => [d._id || 'unknown', d.count]));
 
-    // Update or create profile
+    // Update or create profile — use $set/$unset so anonymousId is never stored as null
     const profile = await UserBehaviorProfile.findOneAndUpdate(
       { userId },
       {
-        userId,
-        anonymousId: null,
-        totalEvents,
-        totalSessions,
-        avgSessionDuration,
-        favoritePages,
-        topEventTypes,
-        lastSeenBusiness: lastBusinessEvent?.properties?.businessId || undefined,
-        lastSeenBusinessAt: lastBusinessEvent?.timestamp || undefined,
-        deviceTypes,
-        lastActive,
-        lastAggregatedAt: new Date(),
+        $set: {
+          userId,
+          totalEvents,
+          totalSessions,
+          avgSessionDuration,
+          favoritePages,
+          topEventTypes,
+          ...(lastBusinessEvent?.properties?.businessId
+            ? { lastSeenBusiness: lastBusinessEvent.properties.businessId, lastSeenBusinessAt: lastBusinessEvent.timestamp }
+            : {}),
+          deviceTypes,
+          lastActive,
+          lastAggregatedAt: new Date(),
+        },
+        // Explicitly remove anonymousId — authenticated profiles must not have it
+        $unset: { anonymousId: '' },
       },
       { upsert: true, new: true }
     );
@@ -214,20 +218,23 @@ exports.aggregateAnonymousProfile = async (anonymousId) => {
 
     const deviceTypes = new Map(deviceStats.map((d) => [d._id || 'unknown', d.count]));
 
-    // Update or create profile
+    // Update or create profile — use $set/$unset so userId is never stored as null
     const profile = await UserBehaviorProfile.findOneAndUpdate(
       { anonymousId },
       {
-        userId: null,
-        anonymousId,
-        totalEvents,
-        totalSessions,
-        avgSessionDuration,
-        favoritePages,
-        topEventTypes,
-        deviceTypes,
-        lastActive,
-        lastAggregatedAt: new Date(),
+        $set: {
+          anonymousId,
+          totalEvents,
+          totalSessions,
+          avgSessionDuration,
+          favoritePages,
+          topEventTypes,
+          deviceTypes,
+          lastActive,
+          lastAggregatedAt: new Date(),
+        },
+        // Explicitly remove userId — anonymous profiles must not have it
+        $unset: { userId: '' },
       },
       { upsert: true, new: true }
     );

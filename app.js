@@ -44,11 +44,13 @@ app.use(morgan('dev'));
 // Apply rate limiter to tracking endpoints
 app.use('/api/track', rateLimiter);
 app.use('/api/session', rateLimiter);
+app.use('/api/auth-logs', rateLimiter);
 
 // Route mounting
 app.use('/api/track', require('./routes/tracking'));
 app.use('/api/session', require('./routes/session'));
 app.use('/api/analytics', require('./routes/analytics'));
+app.use('/api/auth-logs', require('./routes/authLogs'));
 
 // 404 handler
 app.use((req, res, next) => {
