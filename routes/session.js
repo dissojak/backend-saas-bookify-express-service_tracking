@@ -10,7 +10,10 @@ router.post('/start', authMiddleware, ...sessionValidator.startSession, sessionC
 // PATCH /api/session/:id/end - end a session
 router.patch('/:id/end', authMiddleware, ...sessionValidator.endSession, sessionController.endSession);
 
-// POST /api/session/:id/end - end a session (sendBeacon compatibility — sendBeacon always sends POST)
+// POST /api/session/:id/end — sendBeacon compat (sendBeacon always sends POST)
 router.post('/:id/end', authMiddleware, ...sessionValidator.endSession, sessionController.endSession);
+
+// PATCH /api/session/:id/activity — lightweight heartbeat (update lastActivityAt)
+router.patch('/:id/activity', authMiddleware, sessionController.updateActivity);
 
 module.exports = router;
