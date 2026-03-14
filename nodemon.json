@@ -1,0 +1,27 @@
+{
+  "watch": [
+    "app.js",
+    "server.js",
+    "config",
+    "controllers",
+    "middleware",
+    "models",
+    "routes",
+    "services",
+    "jobs",
+    "tracking",
+    "utils",
+    "validators"
+  ],
+  "ignore": [
+    "node_modules",
+    ".git",
+    "**/*.test.js"
+  ],
+  "delay": 2000,
+  "restartable": "rs",
+  "verbose": true,
+  "env": {
+    "NODE_ENV": "development"
+  }
+}
