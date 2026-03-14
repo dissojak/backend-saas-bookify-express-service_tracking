@@ -8,17 +8,18 @@
     "seed": "node seeds/seedEvents.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "mongoose": "^7.5.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
-    "helmet": "^7.0.0",
-    "morgan": "^1.10.0",
-    "express-validator": "^7.0.1",
-    "express-rate-limit": "^7.0.0",
-    "node-cron": "^3.0.3",
+    "express": "^4.18.2",
     "express-async-handler": "^1.2.0",
-    "uuid": "^9.0.0"
+    "express-rate-limit": "^7.0.0",
+    "express-validator": "^7.0.1",
+    "helmet": "^7.0.0",
+    "mongoose": "^7.5.0",
+    "morgan": "^1.10.0",
+    "node-cron": "^3.0.3",
+    "ua-parser-js": "^2.0.9",
+    "uuid": "^9.0.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
