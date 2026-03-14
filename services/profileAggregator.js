@@ -1,270 +1,284 @@
+/**
+ * profileAggregator.js
+ *
+ * Builds / refreshes the userBehaviorProfiles collection from raw events + sessions.
+ * Called by profileAggregationJob on a schedule (every hour in prod, every 5 min in dev).
+ *
+ * Each aggregation uses $facet to compute all sub-metrics in a single MongoDB pass
+ * over the source collection, then writes the result with findOneAndUpdate (upsert).
+ *
+ * New fields computed vs. v1:
+ *  - totalSessionDuration   (sum of all session durations)
+ *  - avgEventsPerSession    (totalEvents / totalSessions)
+ *  - browserTypes           (browser → count Map)
+ *  - countriesUsed          (country → count Map)
+ *  - firstSeenAt            (earliest event timestamp)
+ *  - lastKnownIp            (IP from most recent event)
+ */
+
 const Event = require('../models/event');
 const Session = require('../models/session');
 const UserBehaviorProfile = require('../models/userBehaviorProfile');
 const logger = require('../utils/logger');
 
+// ── Top-level orchestration ────────────────────────────────────────────────────
+
 /**
- * Aggregate profiles for all users
- * Called hourly by CRON job
+ * Aggregate profiles for ALL users (authenticated + anonymous).
+ * Called by the CRON job.
  */
 exports.aggregateProfiles = async () => {
-  try {
-    logger.info('Starting profile aggregation...');
+  logger.info('[profileAggregator] Starting full aggregation run...');
 
-    // Get all unique users from sessions (both userId and anonymousId)
-    const userIds = await Session.distinct('userId', { userId: { $ne: null } });
-    const anonymousIds = await Session.distinct('anonymousId', { anonymousId: { $ne: null } });
+  const [userIds, anonymousIds] = await Promise.all([
+    Session.distinct('userId', { userId: { $ne: null } }),
+    Session.distinct('anonymousId', { anonymousId: { $ne: null } }),
+  ]);
 
-    logger.info(`Aggregating profiles for ${userIds.length} users + ${anonymousIds.length} anonymous users`);
+  logger.info(
+    `[profileAggregator] ${userIds.length} authenticated + ${anonymousIds.length} anonymous users`
+  );
 
-    let successCount = 0;
-    let errorCount = 0;
+  let successCount = 0;
+  let errorCount = 0;
 
-    // Aggregate authenticated users
-    for (const userId of userIds) {
-      try {
-        await exports.aggregateUserProfile(userId);
-        successCount++;
-      } catch (err) {
-        logger.error(`Error aggregating profile for user ${userId}:`, err.message);
-        errorCount++;
-      }
+  for (const userId of userIds) {
+    try {
+      await exports.aggregateUserProfile(userId);
+      successCount++;
+    } catch (err) {
+      logger.error(`[profileAggregator] user=${userId}`, err.message);
+      errorCount++;
     }
-
-    // Aggregate anonymous users
-    for (const anonymousId of anonymousIds) {
-      try {
-        await exports.aggregateAnonymousProfile(anonymousId);
-        successCount++;
-      } catch (err) {
-        logger.error(`Error aggregating profile for anonymous user ${anonymousId}:`, err.message);
-        errorCount++;
-      }
-    }
-
-    logger.info(
-      `Profile aggregation completed. Success: ${successCount}, Errors: ${errorCount}`
-    );
-    return { successCount, errorCount };
-  } catch (err) {
-    logger.error('Error in aggregateProfiles:', err);
-    throw err;
   }
+
+  for (const anonymousId of anonymousIds) {
+    try {
+      await exports.aggregateAnonymousProfile(anonymousId);
+      successCount++;
+    } catch (err) {
+      logger.error(`[profileAggregator] anon=${anonymousId}`, err.message);
+      errorCount++;
+    }
+  }
+
+  logger.info(`[profileAggregator] Done. success=${successCount} errors=${errorCount}`);
+  return { successCount, errorCount };
 };
 
+// ── Per-user aggregation ───────────────────────────────────────────────────────
+
 /**
- * Aggregate profile for a single authenticated user using MongoDB aggregation
- * @param {String} userId - User ID
+ * Rebuild the behavior profile for a single authenticated user.
+ * Uses two parallel aggregation pipelines (sessions + events) joined in JS.
  */
 exports.aggregateUserProfile = async (userId) => {
-  try {
-    // Get session stats using aggregation pipeline
-    const sessionStats = await Session.aggregate([
-      { $match: { userId, isActive: false } },
-      {
-        $group: {
-          _id: null,
-          totalSessions: { $sum: 1 },
-          totalDuration: { $sum: '$duration' },
-          avgSessionDuration: { $avg: '$duration' },
-        },
-      },
-    ]);
+  const [sessionStats, eventStats, deviceStats, browserStats, countryStats] = await Promise.all([
+    _sessionStats({ userId }),
+    _eventStats({ userId }),
+    _deviceStats({ userId }),
+    _browserStats({ userId }),
+    _countryStats({ userId }),
+  ]);
 
-    const totalSessions = sessionStats[0]?.totalSessions || 0;
-    const avgSessionDuration = sessionStats[0]?.avgSessionDuration || 0;
-
-    if (totalSessions === 0) {
-      logger.warn(`No completed sessions found for user ${userId}`);
-      return null;
-    }
-
-    // Get event stats using aggregation pipeline
-    const eventStats = await Event.aggregate([
-      { $match: { userId } },
-      {
-        $facet: {
-          totalCount: [{ $count: 'count' }],
-          topPages: [
-            { $group: { _id: '$page', count: { $sum: 1 } } },
-            { $sort: { count: -1 } },
-            { $limit: 5 },
-          ],
-          eventTypes: [
-            { $group: { _id: '$eventType', count: { $sum: 1 } } },
-          ],
-          lastActivity: [
-            { $sort: { timestamp: -1 } },
-            { $limit: 1 },
-            { $project: { timestamp: 1 } },
-          ],
-          lastBusinessView: [
-            { $match: { eventType: 'business_view' } },
-            { $sort: { timestamp: -1 } },
-            { $limit: 1 },
-            { $project: { 'properties.businessId': 1, timestamp: 1 } },
-          ],
-        },
-      },
-    ]);
-
-    const totalEvents = eventStats[0].totalCount[0]?.count || 0;
-    const favoritePages = eventStats[0].topPages.map((p) => p._id);
-    const topEventTypes = new Map(eventStats[0].eventTypes.map((t) => [t._id, t.count]));
-    const lastActive = eventStats[0].lastActivity[0]?.timestamp || new Date();
-    const lastBusinessEvent = eventStats[0].lastBusinessView[0];
-
-    // Get device type distribution
-    const deviceStats = await Session.aggregate([
-      { $match: { userId } },
-      { $group: { _id: '$deviceType', count: { $sum: 1 } } },
-    ]);
-
-    const deviceTypes = new Map(deviceStats.map((d) => [d._id || 'unknown', d.count]));
-
-    // Update or create profile — use $set/$unset so anonymousId is never stored as null
-    const profile = await UserBehaviorProfile.findOneAndUpdate(
-      { userId },
-      {
-        $set: {
-          userId,
-          totalEvents,
-          totalSessions,
-          avgSessionDuration,
-          favoritePages,
-          topEventTypes,
-          ...(lastBusinessEvent?.properties?.businessId
-            ? { lastSeenBusiness: lastBusinessEvent.properties.businessId, lastSeenBusinessAt: lastBusinessEvent.timestamp }
-            : {}),
-          deviceTypes,
-          lastActive,
-          lastAggregatedAt: new Date(),
-        },
-        // Explicitly remove anonymousId — authenticated profiles must not have it
-        $unset: { anonymousId: '' },
-      },
-      { upsert: true, new: true }
-    );
-
-    logger.info(
-      `Profile aggregated for user ${userId}: ${totalEvents} events, ${totalSessions} sessions`
-    );
-    return profile;
-  } catch (err) {
-    logger.error(`Error aggregating profile for user ${userId}:`, err);
-    throw err;
+  if (!sessionStats.totalSessions) {
+    logger.debug(`[profileAggregator] no completed sessions for user=${userId} — skipping`);
+    return null;
   }
+
+  const avgEventsPerSession =
+    sessionStats.totalSessions > 0
+      ? Math.round(eventStats.totalEvents / sessionStats.totalSessions)
+      : 0;
+
+  const updates = {
+    userId,
+    totalEvents: eventStats.totalEvents,
+    totalSessions: sessionStats.totalSessions,
+    totalSessionDuration: sessionStats.totalDuration,
+    avgSessionDuration: Math.round(sessionStats.avgDuration),
+    avgEventsPerSession,
+    favoritePages: eventStats.favoritePages,
+    topEventTypes: new Map(eventStats.eventTypes),
+    deviceTypes: new Map(deviceStats),
+    browserTypes: new Map(browserStats),
+    countriesUsed: new Map(countryStats),
+    firstSeenAt: eventStats.firstSeen,
+    lastActive: eventStats.lastActive,
+    lastKnownIp: eventStats.lastKnownIp,
+    lastAggregatedAt: new Date(),
+    ...(eventStats.lastBusinessId
+      ? { lastSeenBusiness: eventStats.lastBusinessId, lastSeenBusinessAt: eventStats.lastBusinessAt }
+      : {}),
+  };
+
+  const profile = await UserBehaviorProfile.findOneAndUpdate(
+    { userId },
+    { $set: updates, $unset: { anonymousId: '' } },
+    { upsert: true, new: true }
+  );
+
+  logger.info(
+    `[profileAggregator] user=${userId} events=${eventStats.totalEvents} sessions=${sessionStats.totalSessions}`
+  );
+  return profile;
 };
 
 /**
- * Aggregate profile for an anonymous user using MongoDB aggregation
- * @param {String} anonymousId - Anonymous user ID (UUID)
+ * Rebuild the behavior profile for a single anonymous visitor.
  */
 exports.aggregateAnonymousProfile = async (anonymousId) => {
-  try {
-    // Get session stats
-    const sessionStats = await Session.aggregate([
-      { $match: { anonymousId, isActive: false } },
-      {
-        $group: {
-          _id: null,
-          totalSessions: { $sum: 1 },
-          avgSessionDuration: { $avg: '$duration' },
-        },
-      },
-    ]);
+  const [sessionStats, eventStats, deviceStats, browserStats, countryStats] = await Promise.all([
+    _sessionStats({ anonymousId }),
+    _eventStats({ anonymousId }),
+    _deviceStats({ anonymousId }),
+    _browserStats({ anonymousId }),
+    _countryStats({ anonymousId }),
+  ]);
 
-    const totalSessions = sessionStats[0]?.totalSessions || 0;
-    const avgSessionDuration = sessionStats[0]?.avgSessionDuration || 0;
-
-    if (totalSessions === 0) {
-      logger.warn(`No completed sessions found for anonymous user ${anonymousId}`);
-      return null;
-    }
-
-    // Get event stats
-    const eventStats = await Event.aggregate([
-      { $match: { anonymousId } },
-      {
-        $facet: {
-          totalCount: [{ $count: 'count' }],
-          topPages: [
-            { $group: { _id: '$page', count: { $sum: 1 } } },
-            { $sort: { count: -1 } },
-            { $limit: 5 },
-          ],
-          eventTypes: [
-            { $group: { _id: '$eventType', count: { $sum: 1 } } },
-          ],
-          lastActivity: [
-            { $sort: { timestamp: -1 } },
-            { $limit: 1 },
-            { $project: { timestamp: 1 } },
-          ],
-        },
-      },
-    ]);
-
-    const totalEvents = eventStats[0].totalCount[0]?.count || 0;
-    const favoritePages = eventStats[0].topPages.map((p) => p._id);
-    const topEventTypes = new Map(eventStats[0].eventTypes.map((t) => [t._id, t.count]));
-    const lastActive = eventStats[0].lastActivity[0]?.timestamp || new Date();
-
-    // Get device types
-    const deviceStats = await Session.aggregate([
-      { $match: { anonymousId } },
-      { $group: { _id: '$deviceType', count: { $sum: 1 } } },
-    ]);
-
-    const deviceTypes = new Map(deviceStats.map((d) => [d._id || 'unknown', d.count]));
-
-    // Update or create profile — use $set/$unset so userId is never stored as null
-    const profile = await UserBehaviorProfile.findOneAndUpdate(
-      { anonymousId },
-      {
-        $set: {
-          anonymousId,
-          totalEvents,
-          totalSessions,
-          avgSessionDuration,
-          favoritePages,
-          topEventTypes,
-          deviceTypes,
-          lastActive,
-          lastAggregatedAt: new Date(),
-        },
-        // Explicitly remove userId — anonymous profiles must not have it
-        $unset: { userId: '' },
-      },
-      { upsert: true, new: true }
-    );
-
-    logger.info(
-      `Profile aggregated for anonymous user ${anonymousId}: ${totalEvents} events, ${totalSessions} sessions`
-    );
-    return profile;
-  } catch (err) {
-    logger.error(`Error aggregating profile for anonymous user ${anonymousId}:`, err);
-    throw err;
+  if (!sessionStats.totalSessions) {
+    logger.debug(`[profileAggregator] no completed sessions for anon=${anonymousId} — skipping`);
+    return null;
   }
+
+  const avgEventsPerSession =
+    sessionStats.totalSessions > 0
+      ? Math.round(eventStats.totalEvents / sessionStats.totalSessions)
+      : 0;
+
+  const updates = {
+    anonymousId,
+    totalEvents: eventStats.totalEvents,
+    totalSessions: sessionStats.totalSessions,
+    totalSessionDuration: sessionStats.totalDuration,
+    avgSessionDuration: Math.round(sessionStats.avgDuration),
+    avgEventsPerSession,
+    favoritePages: eventStats.favoritePages,
+    topEventTypes: new Map(eventStats.eventTypes),
+    deviceTypes: new Map(deviceStats),
+    browserTypes: new Map(browserStats),
+    countriesUsed: new Map(countryStats),
+    firstSeenAt: eventStats.firstSeen,
+    lastActive: eventStats.lastActive,
+    lastKnownIp: eventStats.lastKnownIp,
+    lastAggregatedAt: new Date(),
+  };
+
+  const profile = await UserBehaviorProfile.findOneAndUpdate(
+    { anonymousId },
+    { $set: updates, $unset: { userId: '' } },
+    { upsert: true, new: true }
+  );
+
+  logger.info(
+    `[profileAggregator] anon=${anonymousId} events=${eventStats.totalEvents} sessions=${sessionStats.totalSessions}`
+  );
+  return profile;
 };
 
 /**
- * Get aggregated profile for a user
- * @param {String} userId - User ID (can be null for anonymous)
- * @param {String} anonymousId - Anonymous ID
- * @returns {Promise<Object>} - User behavior profile
+ * Fetch the current profile for a user or anonymous visitor.
  */
 exports.getUserProfile = async (userId = null, anonymousId = null) => {
-  try {
-    const query = {};
-    if (userId) query.userId = userId;
-    if (anonymousId) query.anonymousId = anonymousId;
-
-    const profile = await UserBehaviorProfile.findOne(query);
-    return profile;
-  } catch (err) {
-    logger.error('Error fetching user profile:', err);
-    throw err;
-  }
+  const query = {};
+  if (userId) query.userId = userId;
+  if (anonymousId) query.anonymousId = anonymousId;
+  return UserBehaviorProfile.findOne(query);
 };
+
+// ── Private aggregation helpers ───────────────────────────────────────────────
+
+async function _sessionStats(match) {
+  const result = await Session.aggregate([
+    { $match: { ...match, isActive: false } },
+    {
+      $group: {
+        _id: null,
+        totalSessions: { $sum: 1 },
+        totalDuration: { $sum: '$duration' },
+        avgDuration: { $avg: '$duration' },
+      },
+    },
+  ]);
+  return {
+    totalSessions: result[0]?.totalSessions || 0,
+    totalDuration: result[0]?.totalDuration || 0,
+    avgDuration: result[0]?.avgDuration || 0,
+  };
+}
+
+async function _eventStats(match) {
+  const result = await Event.aggregate([
+    { $match: match },
+    {
+      $facet: {
+        totalCount: [{ $count: 'n' }],
+        topPages: [
+          { $group: { _id: '$page', count: { $sum: 1 } } },
+          { $sort: { count: -1 } },
+          { $limit: 5 },
+        ],
+        eventTypes: [{ $group: { _id: '$eventType', count: { $sum: 1 } } }],
+        firstActivity: [
+          { $sort: { timestamp: 1 } },
+          { $limit: 1 },
+          { $project: { timestamp: 1 } },
+        ],
+        lastActivity: [
+          { $sort: { timestamp: -1 } },
+          { $limit: 1 },
+          { $project: { timestamp: 1, ipAddress: 1 } },
+        ],
+        lastBusinessView: [
+          { $match: { eventType: 'business_view' } },
+          { $sort: { timestamp: -1 } },
+          { $limit: 1 },
+          { $project: { 'properties.businessId': 1, timestamp: 1 } },
+        ],
+      },
+    },
+  ]);
+
+  const r = result[0];
+  const lastDoc = r.lastActivity[0];
+  const lastBiz = r.lastBusinessView[0];
+
+  return {
+    totalEvents: r.totalCount[0]?.n || 0,
+    favoritePages: r.topPages.map((p) => p._id).filter(Boolean),
+    eventTypes: r.eventTypes.map((t) => [t._id, t.count]),
+    firstSeen: r.firstActivity[0]?.timestamp || null,
+    lastActive: lastDoc?.timestamp || null,
+    lastKnownIp: lastDoc?.ipAddress || null,
+    lastBusinessId: lastBiz?.properties?.businessId || null,
+    lastBusinessAt: lastBiz?.timestamp || null,
+  };
+}
+
+async function _deviceStats(match) {
+  const result = await Session.aggregate([
+    { $match: match },
+    { $group: { _id: '$deviceType', count: { $sum: 1 } } },
+  ]);
+  return result.map((d) => [d._id || 'unknown', d.count]);
+}
+
+async function _browserStats(match) {
+  const result = await Event.aggregate([
+    { $match: match },
+    { $group: { _id: '$browser', count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
+    { $limit: 10 },
+  ]);
+  return result.map((b) => [b._id || 'Unknown', b.count]);
+}
+
+async function _countryStats(match) {
+  const result = await Session.aggregate([
+    { $match: { ...match, country: { $ne: '' } } },
+    { $group: { _id: '$country', count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
+    { $limit: 20 },
+  ]);
+  return result.map((c) => [c._id, c.count]);
+}
