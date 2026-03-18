@@ -1,5 +1,5 @@
 {
-  "name": "bookify-tracking-service",
+  "name": "kayedni-tracking-service",
   "version": "1.0.0",
   "description": "Express microservice for behavioral tracking and analytics",
   "main": "server.js",
